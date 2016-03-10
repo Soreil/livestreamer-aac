@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 var config = struct {
@@ -25,6 +26,8 @@ var dispatcher = Dispatcher{
 func main() {
 	readConfig()
 	go fallback()
+	go stream()
+	go dispatcher.Listen()
 	log.Printf("Listening on %s", config.Address)
 	throw(http.ListenAndServe(config.Address, http.HandlerFunc(serveStream)))
 }
@@ -88,22 +91,32 @@ func serveStream(res http.ResponseWriter, req *http.Request) {
 // Dispatcher writes the received []byte from either the fallback stream or the
 // transcoded livestreamer output to all connected clients
 type Dispatcher struct {
-	isLive bool
+	isLive      bool
+	lastMessage time.Time
 	sync.Mutex
 	clients  map[int64]chan<- []byte
 	fallback chan []byte
 	stream   chan []byte
 }
 
-// Listen receives messages from
+// Listen receives messages from both the stream and fallback loop
 func (d *Dispatcher) Listen() {
 	for {
 		select {
 		case buf := <-d.fallback:
-			if !d.isLive {
+			// If more than  100 ms have passed since the last stream message,
+			// switch to the fallback
+			if d.isLive {
+				if time.Since(d.lastMessage).Nanoseconds() > 100000 {
+					d.isLive = false
+					d.write(buf)
+				}
+			} else {
 				d.write(buf)
 			}
 		case buf := <-d.stream:
+			d.isLive = true
+			d.lastMessage = time.Now()
 			d.write(buf)
 		}
 	}
@@ -163,14 +176,35 @@ func fallback() {
 			"-c:a", "copy", "-f", "adts", "-bufsize", "496K", "-",
 		)
 		ffmpeg.Stderr = os.Stderr
-		ffmpeg.Stdout = fallbackWriter{}
+		ffmpeg.Stdout = streamWriter{true}
 		throw(ffmpeg.Run())
 	}
 }
 
-type fallbackWriter struct{}
+// Streamwriter pipes the output of a child process into the dispatcher
+type streamWriter struct {
+	isFallback bool
+}
 
-func (fallbackWriter) Write(buf []byte) (n int, err error) {
-	dispatcher.write(buf)
+func (s streamWriter) Write(buf []byte) (int, error) {
+	if s.isFallback {
+		dispatcher.fallback <- buf
+	} else {
+		dispatcher.stream <- buf
+	}
 	return len(buf), nil
+}
+
+func stream() {
+	for {
+		ls := exec.Command(
+			"livestreamer",
+			"--retry-streams", "10",
+			"-O",
+			config.URL, "best",
+		)
+		ls.Stderr = os.Stderr
+		ls.Stdout = streamWriter{}
+		throw(ls.Run())
+	}
 }
